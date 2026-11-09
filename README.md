@@ -59,7 +59,7 @@ Source: [`crates/fff-mcp/`](./crates/fff-mcp/).
 ### Cursor state across worker restarts
 
 A process supervisor can stop idle MCP workers to release the content index.
-Set `FFF_MCP_CURSOR_STATE` to a file shared across that client's worker instances
+Set `FFF_MCP_CURSOR_STATE` to an existing file shared across that client's worker instances
 so pagination cursors survive those restarts. Resumed workers wait for the full
 index before serving requests. Without this variable, startup stays asynchronous.
 Use a separate state file per client session and remove it when the session ends.
@@ -74,8 +74,7 @@ export FFF_MCP_CURSOR_STATE=/proc/self/fd/3
 export MIMALLOC_ARENA_EAGER_COMMIT=0
 ```
 
-Pass file descriptor 3 to each worker. The variable preserves cursor metadata;
-the supervisor owns stopping and restarting `fff-mcp`. Search and ranking behavior are unchanged.
+The supervisor must pass file descriptor 3 to each restarted worker.
 
 </details>
 
