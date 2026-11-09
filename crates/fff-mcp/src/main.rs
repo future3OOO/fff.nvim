@@ -279,26 +279,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create and start the MCP server
-    let server = FffServer::new(shared_picker.clone(), shared_frecency.clone());
-
-    // Wait for initial scan in background — don't block server startup
+    let (server, resuming) = FffServer::new(shared_picker.clone(), shared_frecency.clone())?;
     let picker_clone_for_scan = shared_picker.clone();
-    tokio::task::spawn_blocking(move || {
+    let wait = move || {
         let start = std::time::Instant::now();
         loop {
-            let is_scanning = picker_clone_for_scan
+            let not_ready = picker_clone_for_scan
                 .read()
                 .ok()
-                .and_then(|g| g.as_ref().map(|p| p.is_scan_active()))
+                .and_then(|guard| {
+                    guard.as_ref().map(|picker| {
+                        if resuming {
+                            !picker.get_scan_progress().is_watcher_ready
+                        } else {
+                            picker.is_scan_active()
+                        }
+                    })
+                })
                 .unwrap_or(true);
-
-            if !is_scanning {
+            if !not_ready {
                 tracing::info!("Initial scan completed in {:?}", start.elapsed());
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-    });
+    };
+    if resuming {
+        wait();
+    } else {
+        tokio::task::spawn_blocking(wait);
+    }
 
     let service = server
         .serve(stdio())

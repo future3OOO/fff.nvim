@@ -190,31 +190,21 @@ pub struct FffServer {
 }
 
 impl FffServer {
-    pub fn new(picker: SharedFilePicker, frecency: SharedFrecency) -> Self {
-        Self {
-            picker,
-            frecency,
-            cursor_store: Arc::new(Mutex::new(CursorStore::new())),
-            update_notice_sent: Arc::new(AtomicBool::new(false)),
-            tool_router: Self::tool_router(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn wait_for_scan(&self) {
-        loop {
-            let guard = self.picker.read().ok();
-            let is_scanning = guard
-                .as_ref()
-                .and_then(|g| g.as_ref())
-                .map(|p| p.is_scan_active())
-                .unwrap_or(true);
-
-            if !is_scanning {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+    pub fn new(
+        picker: SharedFilePicker,
+        frecency: SharedFrecency,
+    ) -> std::io::Result<(Self, bool)> {
+        let (cursor_store, resuming) = CursorStore::new()?;
+        Ok((
+            Self {
+                picker,
+                frecency,
+                cursor_store: Arc::new(Mutex::new(cursor_store)),
+                update_notice_sent: Arc::new(AtomicBool::new(false)),
+                tool_router: Self::tool_router(),
+            },
+            resuming,
+        ))
     }
 
     fn lock_cursors(&self) -> Result<std::sync::MutexGuard<'_, CursorStore>, ErrorData> {
@@ -223,17 +213,21 @@ impl FffServer {
         })
     }
 
-    fn maybe_append_update_notice(&self, result: &mut CallToolResult) {
+    fn finish_tool_result(&self, result: &mut CallToolResult) -> Result<(), ErrorData> {
+        self.lock_cursors()?.save_session().map_err(|error| {
+            ErrorData::internal_error(format!("Failed to save cursor session: {error}"), None)
+        })?;
         if self.update_notice_sent.swap(true, Ordering::Relaxed) {
-            return;
+            return Ok(());
         }
         let notice = crate::update_check::get_update_notice();
         if notice.is_empty() {
             // Reset so the next call can try again (check may still be in flight)
             self.update_notice_sent.store(false, Ordering::Relaxed);
-            return;
+            return Ok(());
         }
         result.content.push(Content::text(notice));
+        Ok(())
     }
 
     fn perform_grep(
@@ -508,7 +502,7 @@ impl FffServer {
         }
 
         let mut result = CallToolResult::success(vec![Content::text(lines.join("\n"))]);
-        self.maybe_append_update_notice(&mut result);
+        self.finish_tool_result(&mut result)?;
         Ok(result)
     }
 
@@ -542,7 +536,7 @@ impl FffServer {
             output_mode,
             None,
         )?;
-        self.maybe_append_update_notice(&mut result);
+        self.finish_tool_result(&mut result)?;
         Ok(result)
     }
 
@@ -557,7 +551,7 @@ impl FffServer {
         Parameters(params): Parameters<MultiGrepParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let mut result = self.multi_grep_inner(params)?;
-        self.maybe_append_update_notice(&mut result);
+        self.finish_tool_result(&mut result)?;
         Ok(result)
     }
 }
