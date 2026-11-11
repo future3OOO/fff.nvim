@@ -202,6 +202,24 @@ impl SharedFilePicker {
         })
     }
 
+    /// Wait for the initial index and Git metadata needed for search ranking.
+    pub fn wait_for_search_ready(&self, timeout: Duration) -> bool {
+        let start = Instant::now();
+        if !self.wait_for_indexing_complete(timeout) {
+            return false;
+        }
+        let worker = {
+            let guard = self.0.picker.read();
+            match &*guard {
+                Some(picker) => Arc::clone(&picker.git_status_worker),
+                None => return true,
+            }
+        };
+        poll_until(timeout.saturating_sub(start.elapsed()), || {
+            worker.is_initial_refresh_complete()
+        })
+    }
+
     /// Trigger a full filesystem rescan without blocking the caller.
     /// Performs a safe async rescan. Guarantees only single active rescan per picker.
     /// If many rescans requested the last one guaranteed to be finished.

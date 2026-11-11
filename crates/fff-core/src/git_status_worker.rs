@@ -24,6 +24,7 @@ pub(crate) struct GitStatusWorker {
     state: Mutex<Pending>,
     cv: Condvar,
     consumer_spawned: AtomicBool,
+    initial_refresh_done: AtomicBool,
 }
 
 impl GitStatusWorker {
@@ -32,6 +33,7 @@ impl GitStatusWorker {
             state: Mutex::new(Pending::default()),
             cv: Condvar::new(),
             consumer_spawned: AtomicBool::new(false),
+            initial_refresh_done: AtomicBool::new(false),
         })
     }
 
@@ -102,8 +104,11 @@ impl GitStatusWorker {
                     };
 
                     if work.full_rescan {
-                        if let Err(e) = picker.refresh_git_status(&frecency) {
-                            tracing::error!("git-status worker: full rescan failed: {e:?}");
+                        match picker.refresh_git_status(&frecency) {
+                            Ok(_) => mailbox.initial_refresh_done.store(true, Ordering::Release),
+                            Err(e) => {
+                                tracing::error!("git-status worker: full rescan failed: {e:?}");
+                            }
                         }
                     } else if !work.paths.is_empty() {
                         let paths: Vec<PathBuf> = work.paths.into_iter().collect();
@@ -116,5 +121,10 @@ impl GitStatusWorker {
                 tracing::info!("git-status worker stopped");
             })
             .inspect_err(|err| tracing::error!(?err, "Failed to spawn git status worker"));
+    }
+
+    pub(crate) fn is_initial_refresh_complete(&self) -> bool {
+        !self.consumer_spawned.load(Ordering::Acquire)
+            || self.initial_refresh_done.load(Ordering::Acquire)
     }
 }

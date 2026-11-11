@@ -1,7 +1,7 @@
 use crate::cursor::CursorStore;
 use crate::output::{GrepFormatter, OutputMode, file_suffix};
 use fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
-use fff::types::{FileItem, PaginationArgs};
+use fff::types::PaginationArgs;
 use fff::{FuzzySearchOptions, QueryParser, SharedFilePicker};
 use fff_query_parser::AiGrepConfig;
 use rmcp::handler::server::wrapper::Parameters;
@@ -189,6 +189,7 @@ pub struct FffServer {
     update_notice_sent: Arc<AtomicBool>,
     last_activity: Arc<AtomicU64>,
     scan_ready: Arc<AtomicBool>,
+    wait_for_index: bool,
 }
 
 fn now_secs() -> u64 {
@@ -199,14 +200,16 @@ fn now_secs() -> u64 {
 }
 
 impl FffServer {
-    pub fn new(picker: SharedFilePicker) -> Self {
-        Self {
+    pub fn new(picker: SharedFilePicker) -> std::io::Result<Self> {
+        let (cursor_store, wait_for_index) = CursorStore::new()?;
+        Ok(Self {
             picker,
-            cursor_store: Arc::new(Mutex::new(CursorStore::new())),
+            cursor_store: Arc::new(Mutex::new(cursor_store)),
             update_notice_sent: Arc::new(AtomicBool::new(false)),
             last_activity: Arc::new(AtomicU64::new(now_secs())),
             scan_ready: Arc::new(AtomicBool::new(false)),
-        }
+            wait_for_index,
+        })
     }
 
     pub fn last_activity(&self) -> Arc<AtomicU64> {
@@ -222,30 +225,19 @@ impl FffServer {
             return Ok(());
         }
 
-        let deadline = std::time::Instant::now() + timeout;
-
-        loop {
-            let is_scanning = self
-                .picker
-                .read()
-                .ok()
-                .as_ref()
-                .and_then(|g| g.as_ref())
-                .map(|p| p.is_scan_active())
-                .unwrap_or(true);
-
-            if !is_scanning {
-                self.scan_ready.store(true, Ordering::Relaxed);
-                return Ok(());
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(ErrorData::internal_error(
-                    "Index is still building; retry shortly",
-                    None,
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        let ready = if self.wait_for_index {
+            self.picker.wait_for_search_ready(timeout)
+        } else {
+            self.picker.wait_for_scan(timeout)
+        };
+        if !ready {
+            return Err(ErrorData::internal_error(
+                "Index is still building; retry shortly",
+                None,
+            ));
         }
+        self.scan_ready.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     fn lock_cursors(&self) -> Result<std::sync::MutexGuard<'_, CursorStore>, ErrorData> {
@@ -254,17 +246,21 @@ impl FffServer {
         })
     }
 
-    fn maybe_append_update_notice(&self, result: &mut CallToolResult) {
+    fn finish_tool_result(&self, result: &mut CallToolResult) -> Result<(), ErrorData> {
+        self.lock_cursors()?.save_session().map_err(|error| {
+            ErrorData::internal_error(format!("Failed to save cursor session: {error}"), None)
+        })?;
         if self.update_notice_sent.swap(true, Ordering::Relaxed) {
-            return;
+            return Ok(());
         }
         let notice = crate::update_check::get_update_notice();
         if notice.is_empty() {
             // Reset so the next call can try again (check may still be in flight)
             self.update_notice_sent.store(false, Ordering::Relaxed);
-            return;
+            return Ok(());
         }
         result.content.push(Content::text(notice));
+        Ok(())
     }
 
     fn perform_grep(
@@ -547,7 +543,7 @@ impl FffServer {
         }
 
         let mut result = CallToolResult::success(vec![Content::text(lines.join("\n"))]);
-        self.maybe_append_update_notice(&mut result);
+        self.finish_tool_result(&mut result)?;
         Ok(result)
     }
 
@@ -589,7 +585,7 @@ impl FffServer {
             output_mode,
             normalize_context(params.context),
         )?;
-        self.maybe_append_update_notice(&mut result);
+        self.finish_tool_result(&mut result)?;
         Ok(result)
     }
 
@@ -612,7 +608,7 @@ impl FffServer {
         self.wait_for_scan(SCAN_READY_TIMEOUT)?;
 
         let mut result = self.multi_grep_inner(params)?;
-        self.maybe_append_update_notice(&mut result);
+        self.finish_tool_result(&mut result)?;
         Ok(result)
     }
 }
@@ -646,7 +642,6 @@ impl FffServer {
         let constraints = parser.parse_constraints(constraint_query);
 
         let result = picker.multi_grep(&patterns_refs, &constraints, &options);
-        let file_refs: Vec<&FileItem> = result.files.to_vec();
 
         if result.matches.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -657,7 +652,7 @@ impl FffServer {
         let mut cs = self.lock_cursors()?;
         let text = &GrepFormatter {
             matches: &result.matches,
-            files: &file_refs,
+            files: &result.files,
             total_matched: result.matches.len(),
             next_file_offset: result.next_file_offset,
             output_mode,

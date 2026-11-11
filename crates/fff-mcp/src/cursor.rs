@@ -1,28 +1,54 @@
-//! Cursor store for grep pagination.
-//!
-//! Maintains an in-memory map of opaque cursor IDs to file offsets.
-//! Cursors are evicted LRU-style when the store exceeds capacity.
-
 use std::collections::{HashMap, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Seek, Write};
 
 const MAX_CURSORS: usize = 20;
 
-/// Stores cursor state for paginated grep results.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct CursorStore {
     counter: u64,
     /// Map from cursor ID string → file offset for next page.
     cursors: HashMap<String, usize>,
     /// Insertion order for LRU eviction.
     insertion_order: VecDeque<String>,
+    #[serde(skip)]
+    session: Option<File>,
+    #[serde(skip)]
+    dirty: bool,
 }
 
 impl CursorStore {
-    pub fn new() -> Self {
-        Self {
-            counter: 0,
-            cursors: HashMap::new(),
-            insertion_order: VecDeque::new(),
+    pub fn new() -> io::Result<(Self, bool)> {
+        let Some(path) = std::env::var_os("FFF_MCP_CURSOR_STATE") else {
+            return Ok((Self::default(), false));
+        };
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let empty = file.metadata()?.len() == 0;
+        let mut store = if empty {
+            Self::default()
+        } else {
+            serde_json::from_reader(&file).map_err(io::Error::other)?
+        };
+        store.session = Some(file);
+        if empty {
+            store.dirty = true;
+            store.save_session()?;
         }
+        Ok((store, true))
+    }
+
+    pub fn save_session(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        if let Some(mut file) = self.session.as_ref() {
+            let bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
+            file.rewind()?;
+            file.write_all(&bytes)?;
+            file.set_len(bytes.len() as u64)?;
+        }
+        self.dirty = false;
+        Ok(())
     }
 
     /// Store a cursor and return its opaque ID string.
@@ -42,6 +68,7 @@ impl CursorStore {
             }
         }
 
+        self.dirty = true;
         id
     }
 
