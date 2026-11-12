@@ -1,9 +1,16 @@
-use crate::shared::{SharedFrecency, WeakFilePicker};
+use crate::{
+    error::Error,
+    shared::{SharedFrecency, WeakFilePicker},
+};
 use ahash::AHashSet;
 use parking_lot::{Condvar, Mutex};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+const INITIAL_READY: u8 = 0;
+const INITIAL_PENDING: u8 = 1;
+const INITIAL_FAILED: u8 = 2;
 
 // we don't really need a queue here
 #[derive(Default)]
@@ -24,6 +31,7 @@ pub(crate) struct GitStatusWorker {
     state: Mutex<Pending>,
     cv: Condvar,
     consumer_spawned: AtomicBool,
+    initial_refresh: AtomicU8,
 }
 
 impl GitStatusWorker {
@@ -32,6 +40,7 @@ impl GitStatusWorker {
             state: Mutex::new(Pending::default()),
             cv: Condvar::new(),
             consumer_spawned: AtomicBool::new(false),
+            initial_refresh: AtomicU8::new(INITIAL_READY),
         })
     }
 
@@ -45,7 +54,13 @@ impl GitStatusWorker {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            Self::spawn_consumer(Arc::clone(self), weak_picker, frecency);
+            self.initial_refresh
+                .store(INITIAL_PENDING, Ordering::Release);
+            if !Self::spawn_consumer(Arc::clone(self), weak_picker, frecency) {
+                self.initial_refresh
+                    .store(INITIAL_FAILED, Ordering::Release);
+                self.consumer_spawned.store(false, Ordering::Release);
+            }
         }
     }
 
@@ -92,8 +107,8 @@ impl GitStatusWorker {
         mailbox: Arc<GitStatusWorker>,
         weak_picker: WeakFilePicker,
         frecency: SharedFrecency,
-    ) {
-        let _ = std::thread::Builder::new()
+    ) -> bool {
+        std::thread::Builder::new()
             .name("fff-git-status".into())
             .spawn(move || {
                 while let Some(work) = mailbox.wait_and_take() {
@@ -102,8 +117,20 @@ impl GitStatusWorker {
                     };
 
                     if work.full_rescan {
-                        if let Err(e) = picker.refresh_git_status(&frecency) {
-                            tracing::error!("git-status worker: full rescan failed: {e:?}");
+                        match picker.refresh_git_status_checked(&frecency) {
+                            Ok(_) => mailbox
+                                .initial_refresh
+                                .store(INITIAL_READY, Ordering::Release),
+                            Err(e) => {
+                                if mailbox.initial_refresh.load(Ordering::Acquire)
+                                    == INITIAL_PENDING
+                                {
+                                    mailbox
+                                        .initial_refresh
+                                        .store(INITIAL_FAILED, Ordering::Release);
+                                }
+                                tracing::error!("git-status worker: full rescan failed: {e:?}");
+                            }
                         }
                     } else if !work.paths.is_empty() {
                         let paths: Vec<PathBuf> = work.paths.into_iter().collect();
@@ -115,6 +142,15 @@ impl GitStatusWorker {
 
                 tracing::info!("git-status worker stopped");
             })
-            .inspect_err(|err| tracing::error!(?err, "Failed to spawn git status worker"));
+            .inspect_err(|err| tracing::error!(?err, "Failed to spawn git status worker"))
+            .is_ok()
+    }
+
+    pub(crate) fn initial_refresh_result(&self) -> Result<bool, Error> {
+        match self.initial_refresh.load(Ordering::Acquire) {
+            INITIAL_READY => Ok(true),
+            INITIAL_PENDING => Ok(false),
+            _ => Err(Error::SearchInitialization),
+        }
     }
 }

@@ -121,6 +121,29 @@ For any file search or grep in the current git-indexed directory, use fff tools.
 
 Source: [`crates/fff-mcp/`](./crates/fff-mcp/).
 
+### Cursor state across worker restarts
+
+An idle-process supervisor can release the worker's index between requests.
+Set `FFF_MCP_CURSOR_STATE` to an existing read/write file owned by that supervisor
+to preserve pagination cursor IDs, offsets and eviction order across workers.
+Use one file per client session, with only one worker writing it at a time.
+Tools wait for the file scan, content index and initial Git metadata before using
+persistent offsets.
+Without the variable, cursor storage and scan readiness stay unchanged.
+
+On Linux, an inherited unlinked file keeps the state private to the session:
+
+```sh
+state=$(mktemp)
+exec 3<>"$state"
+rm -- "$state"
+export FFF_MCP_CURSOR_STATE=/proc/self/fd/3
+```
+
+Pass descriptor 3 to every replacement worker. Snapshots are saved before returning
+successful cursor results; unreadable, malformed or unwritable state reports an
+error. This supports orderly idle replacement, not interrupted writes or power loss.
+
 </details>
 
 The MCP server gives any agent a file search tool that is faster and more token-efficient than the built-in one.

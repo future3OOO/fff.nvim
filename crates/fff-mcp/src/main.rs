@@ -375,28 +375,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create and start the MCP server
-    let server = FffServer::new(shared_picker.clone());
+    let server = FffServer::new(shared_picker.clone())?;
     let last_activity = server.last_activity();
     let idle_timeout_secs = args.idle_timeout_secs;
-
-    // Wait for initial scan in background — don't block server startup
-    let picker_clone_for_scan = shared_picker.clone();
-    tokio::task::spawn_blocking(move || {
-        let start = std::time::Instant::now();
-        loop {
-            let is_scanning = picker_clone_for_scan
-                .read()
-                .ok()
-                .and_then(|g| g.as_ref().map(|p| p.is_scan_active()))
-                .unwrap_or(true);
-
-            if !is_scanning {
-                tracing::info!("Initial scan completed in {:?}", start.elapsed());
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    });
 
     const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
     let stdio = AsyncRwTransport::new_server(tokio::io::stdin(), tokio::io::stdout());
