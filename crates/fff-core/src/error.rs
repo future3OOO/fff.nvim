@@ -108,6 +108,9 @@ pub enum Error {
     #[error("libgit2 error occurred: {0}")]
     Git(#[from] git2::Error),
 
+    #[error("Initial Git metadata refresh failed; check worker logs or restart the worker")]
+    SearchInitialization,
+
     #[error("Filesystem walk failed: {0}")]
     WalkFailed(String),
 

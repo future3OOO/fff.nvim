@@ -226,7 +226,9 @@ impl FffServer {
         }
 
         let ready = if self.wait_for_index {
-            self.picker.wait_for_search_ready(timeout)
+            self.picker
+                .wait_for_search_ready(timeout)
+                .map_err(|error| ErrorData::internal_error(error.to_string(), None))?
         } else {
             self.picker.wait_for_scan(timeout)
         };

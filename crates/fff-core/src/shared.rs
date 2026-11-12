@@ -203,21 +203,29 @@ impl SharedFilePicker {
     }
 
     /// Wait for the initial index and Git metadata needed for search ranking.
-    pub fn wait_for_search_ready(&self, timeout: Duration) -> bool {
-        let start = Instant::now();
-        if !self.wait_for_indexing_complete(timeout) {
-            return false;
-        }
-        let worker = {
+    pub fn wait_for_search_ready(&self, timeout: Duration) -> Result<bool, Error> {
+        let (scanning, post_scan_active, worker) = {
             let guard = self.0.picker.read();
             match &*guard {
-                Some(picker) => Arc::clone(&picker.git_status_worker),
-                None => return true,
+                Some(picker) => (
+                    Arc::clone(&picker.signals.scanning),
+                    Arc::clone(&picker.signals.post_scan_indexing_active),
+                    Arc::clone(&picker.git_status_worker),
+                ),
+                None => return Ok(true),
             }
         };
-        poll_until(timeout.saturating_sub(start.elapsed()), || {
-            worker.is_initial_refresh_complete()
-        })
+        if !poll_until(timeout, || {
+            let indexed = !scanning.load(std::sync::atomic::Ordering::Acquire)
+                && !post_scan_active.load(std::sync::atomic::Ordering::Acquire);
+            match worker.initial_refresh_result() {
+                Ok(metadata_ready) => indexed && metadata_ready,
+                Err(_) => true,
+            }
+        }) {
+            return Ok(false);
+        }
+        worker.initial_refresh_result()
     }
 
     /// Trigger a full filesystem rescan without blocking the caller.
@@ -368,6 +376,16 @@ impl SharedFilePicker {
     /// Refresh git statuses for all indexed files
     #[tracing::instrument(level = "info", skip_all)]
     pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
+        match self.refresh_git_status_checked(shared_frecency) {
+            Err(Error::SearchInitialization) => Ok(0),
+            result => result,
+        }
+    }
+
+    pub(crate) fn refresh_git_status_checked(
+        &self,
+        shared_frecency: &SharedFrecency,
+    ) -> Result<usize, Error> {
         let (git_root, recency_config, base_path, picker_id) = {
             // we do the libgit2 off lock cause it might take quite some time on very large repos
             let guard = self.read()?;
@@ -394,6 +412,7 @@ impl SharedFilePicker {
                 .inspect_err(|e| tracing::error!(?e, "Failed to read git status"))
                 .ok()
         });
+        let complete = git_root.is_none() || git_status.is_some();
 
         let recency = repo
             .as_ref()
@@ -404,7 +423,7 @@ impl SharedFilePicker {
 
         // ensure consistency
         if picker.trace_id() != picker_id {
-            return Ok(0);
+            return Err(Error::SearchInitialization);
         }
 
         let statuses_count = if let Some(git_status) = git_status {
@@ -417,7 +436,11 @@ impl SharedFilePicker {
 
         picker.apply_git_recency(recency.as_ref());
 
-        Ok(statuses_count)
+        if complete {
+            Ok(statuses_count)
+        } else {
+            Err(Error::SearchInitialization)
+        }
     }
 
     /// Recompute and apply git status for a specific set of paths.
